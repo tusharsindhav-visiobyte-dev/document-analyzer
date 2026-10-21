@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class DocumentType(str, Enum):
@@ -16,9 +16,11 @@ class DocumentType(str, Enum):
 
 
 class ClassificationResponse(BaseModel):
-    """Strict classification schema sent to Gemini structured output."""
+    """Strict classification schema sent to Gemini structured output.
 
-    model_config = ConfigDict(extra="forbid")
+    This model is sent as a Gemini response schema. extra='forbid' would emit
+    additionalProperties, which the Gemini Developer API rejects.
+    """
 
     document_type: DocumentType = Field(
         description=(
@@ -42,8 +44,6 @@ RouterDecision = ClassificationResponse
 class FlightTicketExtractor(BaseModel):
     """Fields extracted from a transport ticket."""
 
-    model_config = ConfigDict(extra="forbid")
-
     pnr: str = Field(description="Booking reference or PNR. Empty string if it is not printed.")
     from_city: str = Field(description="Origin city or airport. Empty string if it is not printed.")
     to_city: str = Field(description="Destination city or airport. Empty string if it is not printed.")
@@ -62,8 +62,6 @@ class FlightTicketExtractor(BaseModel):
 class StayExtractor(BaseModel):
     """Fields extracted from a lodging booking."""
 
-    model_config = ConfigDict(extra="forbid")
-
     check_in: str = Field(
         description="Check-in date in pure ISO 8601 format, YYYY-MM-DD. Empty string if it is not printed."
     )
@@ -75,6 +73,57 @@ class StayExtractor(BaseModel):
     total_price: float = Field(description="Numeric booking total without a currency symbol. Use 0 when missing.")
     currency: str = Field(description="Currency code or symbol, such as INR. Empty string if it is not printed.")
     capacity: int = Field(description="Number of guests the booking covers. Use 0 when the count is not printed.")
+
+
+class DocumentExtraction(BaseModel):
+    """One Gemini response that classifies the document and extracts its fields.
+
+    Ticket fields stay empty unless document_type is TICKET.
+    Stay fields stay empty unless document_type is STAY.
+    """
+
+    document_type: DocumentType = Field(
+        description=(
+            "TICKET for flight, train, or bus tickets and boarding passes. "
+            "STAY for hotels and other lodging. "
+            "ACTIVITY for tours, attractions, and experiences. "
+            "UNKNOWN when the document does not fit those categories or is unreadable."
+        )
+    )
+    provider: str = Field(
+        description=(
+            "Company that issued or sold the document, for example OYO, Indigo, IRCTC, "
+            "or MakeMyTrip. Use UNKNOWN when the provider is not visible."
+        )
+    )
+    pnr: str = Field(description="Ticket booking reference or PNR. Empty string unless document_type is TICKET.")
+    from_city: str = Field(description="Ticket origin. Empty string unless document_type is TICKET.")
+    to_city: str = Field(description="Ticket destination. Empty string unless document_type is TICKET.")
+    departure_time: str = Field(
+        description=(
+            "Ticket departure in pure ISO 8601, YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS. "
+            "Empty string unless document_type is TICKET."
+        )
+    )
+    number_of_people: int = Field(description="Ticket traveler count. Use 0 unless document_type is TICKET.")
+    seat_details: list[str] = Field(
+        description="Ticket seat numbers. Use an empty list unless document_type is TICKET."
+    )
+    check_in: str = Field(
+        description="Stay check-in date as YYYY-MM-DD. Empty string unless document_type is STAY."
+    )
+    check_out: str = Field(
+        description="Stay check-out date as YYYY-MM-DD. Empty string unless document_type is STAY."
+    )
+    hotel_name: str = Field(description="Stay property name. Empty string unless document_type is STAY.")
+    location: str = Field(description="Stay city or address. Empty string unless document_type is STAY.")
+    total_price: float = Field(
+        description="Stay booking total without a currency symbol. Use 0 unless document_type is STAY."
+    )
+    currency: str = Field(
+        description="Stay currency code or symbol, such as INR. Empty string unless document_type is STAY."
+    )
+    capacity: int = Field(description="Stay guest count. Use 0 unless document_type is STAY.")
 
 
 class ClassificationResult(BaseModel):
@@ -154,6 +203,31 @@ class ProcessDocumentResponse(BaseModel):
     classification: ClassificationResult
     extracted_fields: FlightTicketExtractor | StayExtractor | None = None
     features: TicketFeatures | StayFeatures | None = None
+
+
+class SaveDocumentRequest(BaseModel):
+    """Reviewed extraction payload stored for one user."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, description="Application user that owns the saved document.")
+    document_data: ProcessDocumentResponse
+
+    @field_validator("user_id")
+    @classmethod
+    def _user_id_required(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("user_id is required.")
+        return cleaned
+
+
+class SaveDocumentResponse(BaseModel):
+    """Identifier of the MongoDB document created by POST /documents."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="String form of the inserted MongoDB document id.")
 
 
 class ErrorResponse(BaseModel):

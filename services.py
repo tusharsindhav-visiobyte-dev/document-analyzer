@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -26,6 +27,7 @@ from pypdf.errors import PdfReadError
 from schemas import (
     ClassificationResponse,
     ClassificationResult,
+    DocumentExtraction,
     DocumentMetadata,
     DocumentType,
     FlightTicketExtractor,
@@ -59,6 +61,7 @@ _PROVIDER_ALIASES = {
     "makemytrip": "MakeMyTrip",
     "make my trip": "MakeMyTrip",
     "mmt": "MakeMyTrip",
+    "irctc": "IRCTC",
     "unknown": "UNKNOWN",
     "n/a": "UNKNOWN",
     "na": "UNKNOWN",
@@ -151,6 +154,28 @@ FLIGHT_CONFIG = types.GenerateContentConfig(
     response_mime_type="application/json",
     response_schema=FlightTicketExtractor,
 )
+DOCUMENT_CONFIG = types.GenerateContentConfig(
+    system_instruction=(
+        "Classify this travel document and extract its printed fields in one pass. "
+        "Choose exactly one document_type. "
+        "Use TICKET for flight, train, or bus tickets and boarding passes. "
+        "Use STAY for hotels, hostels, homestays, and other lodging bookings. "
+        "Use ACTIVITY for tours, attractions, experiences, and event bookings that are not transport or lodging. "
+        "Use UNKNOWN when the document is unreadable or none of those categories. "
+        "Set provider to the company that issued or sold the document, such as OYO, Indigo, IRCTC, or MakeMyTrip. "
+        "Use UNKNOWN when no provider is visible. Do not guess a provider you cannot read. "
+        "When document_type is TICKET, fill the ticket fields and leave every stay field empty or zero. "
+        "When document_type is STAY, fill the stay fields and leave every ticket field empty or zero. "
+        "When document_type is ACTIVITY or UNKNOWN, leave every extracted field empty or zero. "
+        "Use an empty string for missing text, 0 for missing numbers, and an empty list when no seats are listed. "
+        "Do not invent passenger counts, prices, dates, cities, or seat numbers. "
+        "total_price is the numeric booking total, without a currency symbol. "
+        f"{_ISO_8601_RULE}"
+    ),
+    temperature=0,
+    response_mime_type="application/json",
+    response_schema=DocumentExtraction,
+)
 
 ParsedModel = TypeVar("ParsedModel", bound=BaseModel)
 MediaKind = Literal["pdf", "png", "jpeg"]
@@ -177,6 +202,7 @@ class PreparedDocument:
     input_mode: InputMode
     file_bytes: bytes
     warnings: list[str]
+    text: str | None = None
 
 
 @dataclass(slots=True)
@@ -302,6 +328,28 @@ def extract_flight(
     )
 
 
+def extract_document(
+    file_bytes: bytes,
+    mime_type: str,
+    *,
+    client: genai.Client,
+    model: str,
+    text: str | None = None,
+) -> DocumentExtraction:
+    """Classify a document and extract its fields in one Gemini request."""
+
+    return _generate_structured(
+        client=client,
+        model=model,
+        file_bytes=file_bytes,
+        mime_type=mime_type,
+        instruction="Classify this document and extract its fields.",
+        config=DOCUMENT_CONFIG,
+        schema=DocumentExtraction,
+        text=text,
+    )
+
+
 class DocumentService:
     """Classify a prepared document with Gemini and extract the routed schema."""
 
@@ -339,11 +387,18 @@ class DocumentService:
         self.client = client
 
     def analyze(self, prepared: PreparedDocument) -> Analysis:
-        decision = classify_document(
+        started = time.perf_counter()
+        decision = extract_document(
             prepared.file_bytes,
             prepared.content_type,
             client=self.client,
             model=self.model,
+            text=prepared.text,
+        )
+        logger.info(
+            "Gemini extraction finished in %.2fs using %s thinking",
+            time.perf_counter() - started,
+            _thinking_level_name(),
         )
         classification = ClassificationResult(
             document_type=decision.document_type,
@@ -353,28 +408,14 @@ class DocumentService:
         extracted: FlightTicketExtractor | StayExtractor | None = None
 
         if decision.document_type is DocumentType.TICKET:
-            extracted = _clean_ticket(
-                extract_flight(
-                    prepared.file_bytes,
-                    prepared.content_type,
-                    client=self.client,
-                    model=self.model,
-                )
-            )
+            extracted = _clean_ticket(_ticket_from_extraction(decision))
             if _ticket_is_empty(extracted):
                 raise DocumentProcessingError(
                     422,
                     "The document was classified as a ticket, but no ticket fields could be extracted.",
                 )
         elif decision.document_type is DocumentType.STAY:
-            extracted = _clean_stay(
-                extract_stay(
-                    prepared.file_bytes,
-                    prepared.content_type,
-                    client=self.client,
-                    model=self.model,
-                )
-            )
+            extracted = _clean_stay(_stay_from_extraction(decision))
             if _stay_is_empty(extracted):
                 raise DocumentProcessingError(
                     422,
@@ -419,47 +460,87 @@ def _generate_structured(
     instruction: str,
     config: types.GenerateContentConfig,
     schema: type[ParsedModel],
+    text: str | None = None,
 ) -> ParsedModel:
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=[
-                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                instruction,
-            ],
-            config=config,
-        )
-    except (httpx.TimeoutException, TimeoutError) as exc:
-        raise DocumentProcessingError(
-            504,
-            "The Gemini request timed out before the document could be processed.",
-        ) from exc
-    except errors.APIError as exc:
-        logger.warning("Gemini status %s: %s", exc.code, exc.message)
-        if exc.code in {401, 403}:
-            raise DocumentProcessingError(503, "The Gemini API key was rejected.") from exc
-        if exc.code == 429:
-            raise DocumentProcessingError(
-                429,
-                "The Gemini rate limit was reached. Try again shortly.",
-            ) from exc
-        if exc.code in {408, 504}:
+    contents = _model_contents(
+        file_bytes=file_bytes,
+        mime_type=mime_type,
+        instruction=instruction,
+        text=text,
+    )
+    request_config = config.model_copy(update={"thinking_config": _thinking_config(model)})
+    started = time.perf_counter()
+    for attempt in (1, 2):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=request_config,
+            )
+        except (httpx.TimeoutException, TimeoutError) as exc:
             raise DocumentProcessingError(
                 504,
                 "The Gemini request timed out before the document could be processed.",
             ) from exc
-        raise DocumentProcessingError(
-            502,
-            "The Gemini API returned an error while processing the document.",
-        ) from exc
-    except ValidationError as exc:
-        logger.info("Model output failed schema validation (%s errors).", exc.error_count())
-        raise DocumentProcessingError(
-            422,
-            "The model response did not match the extraction schema.",
-        ) from exc
+        except errors.APIError as exc:
+            logger.warning("Gemini status %s: %s", exc.code, exc.message)
+            if attempt == 1 and exc.code in {429, 503}:
+                logger.warning("Retrying Gemini once after status %s.", exc.code)
+                time.sleep(1)
+                continue
+            if exc.code in {401, 403}:
+                raise DocumentProcessingError(503, "The Gemini API key was rejected.") from exc
+            if exc.code == 429:
+                raise DocumentProcessingError(
+                    429,
+                    "The Gemini rate limit was reached. Try again shortly.",
+                ) from exc
+            if exc.code == 503:
+                raise DocumentProcessingError(
+                    503,
+                    "Gemini is busy right now. Try again shortly.",
+                ) from exc
+            if exc.code in {408, 504}:
+                raise DocumentProcessingError(
+                    504,
+                    "The Gemini request timed out before the document could be processed.",
+                ) from exc
+            raise DocumentProcessingError(
+                502,
+                "The Gemini API returned an error while processing the document.",
+            ) from exc
+        except ValidationError as exc:
+            logger.info("Model output failed schema validation (%s errors).", exc.error_count())
+            raise DocumentProcessingError(
+                422,
+                "The model response did not match the extraction schema.",
+            ) from exc
 
-    return _coerce_schema(response, schema)
+        logger.info(
+            "Gemini %s call finished in %.2fs",
+            schema.__name__,
+            time.perf_counter() - started,
+        )
+        return _coerce_schema(response, schema)
+    raise DocumentProcessingError(502, "The Gemini API returned an error while processing the document.")
+
+
+def _model_contents(
+    *,
+    file_bytes: bytes,
+    mime_type: str,
+    instruction: str,
+    text: str | None,
+) -> list[object]:
+    """Send extracted text when the PDF has a text layer. Scans and images stay as files."""
+
+    cleaned = (text or "").strip()
+    if cleaned:
+        return [f"{instruction}\n\nDocument text:\n{cleaned}"]
+    return [
+        types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+        instruction,
+    ]
 
 
 def _coerce_schema(response: object, schema: type[ParsedModel]) -> ParsedModel:
@@ -500,16 +581,24 @@ def _prepare_pdf(data: bytes) -> PreparedDocument:
         resolved_pages = page_count
         input_mode = "text" if _usable_text(text) else "vision"
 
+    document_text = text if input_mode == "text" else None
+    pages_processed = min(resolved_pages, 8) if document_text else resolved_pages
+    if document_text and resolved_pages > pages_processed:
+        warnings.append(
+            f"Only the first {pages_processed} of {resolved_pages} pages were sent to the model."
+        )
+
     return PreparedDocument(
         filename="",
         content_type=_MIME_TYPES["pdf"],
         media_kind="pdf",
         size_bytes=len(data),
         page_count=resolved_pages,
-        pages_processed=resolved_pages,
+        pages_processed=pages_processed,
         input_mode=input_mode,
         file_bytes=data,
         warnings=warnings,
+        text=document_text,
     )
 
 
@@ -602,6 +691,60 @@ def _safe_filename(filename: str | None) -> str:
 def _usable_text(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     return len(compact) >= MIN_TEXT_CHARS
+
+
+def _thinking_level_name() -> str:
+    raw = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
+    if raw in {"minimal", "low", "medium", "high"}:
+        return raw
+    return "low"
+
+
+def _thinking_config(model: str) -> types.ThinkingConfig:
+    """Use low thinking unless GEMINI_THINKING_LEVEL asks for more.
+
+    gemini-3.8-flash defaults to medium thinking, which is slow for field extraction.
+    Gemini 2.5 uses a token budget. Later Gemini models use a thinking level, and
+    gemini-3.8-flash rejects the minimal level.
+    """
+
+    level = _thinking_level_name()
+    name = model.lower()
+    if "gemini-2.5" in name or "gemini-2-5" in name:
+        budget = 0 if level in {"minimal", "low"} else -1
+        return types.ThinkingConfig(thinking_budget=budget)
+    if level == "minimal" and "3.8" in name:
+        level = "low"
+    levels = {
+        "minimal": types.ThinkingLevel.MINIMAL,
+        "low": types.ThinkingLevel.LOW,
+        "medium": types.ThinkingLevel.MEDIUM,
+        "high": types.ThinkingLevel.HIGH,
+    }
+    return types.ThinkingConfig(thinking_level=levels[level])
+
+
+def _ticket_from_extraction(document: DocumentExtraction) -> FlightTicketExtractor:
+    return FlightTicketExtractor(
+        pnr=document.pnr,
+        from_city=document.from_city,
+        to_city=document.to_city,
+        departure_time=document.departure_time,
+        number_of_people=document.number_of_people,
+        seat_details=document.seat_details,
+    )
+
+
+def _stay_from_extraction(document: DocumentExtraction) -> StayExtractor:
+    return StayExtractor(
+        check_in=document.check_in,
+        check_out=document.check_out,
+        hotel_name=document.hotel_name,
+        location=document.location,
+        total_price=document.total_price,
+        currency=document.currency,
+        capacity=document.capacity,
+    )
 
 
 def _normalize_provider(value: str) -> str:
